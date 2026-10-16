@@ -8,8 +8,12 @@ CACHE=json.loads(Path(__file__).with_name('xposts.json').read_text(encoding='utf
 LAST=0.0
 DAY=''
 COUNT=0
-INTERVAL=max(30,int(os.getenv('MIN_REFRESH_SECONDS','60')))
+INTERVAL=max(30,int(os.getenv('MIN_REFRESH_SECONDS','30')))
 LIMIT=max(0,int(os.getenv('MAX_COLLECTIONS_PER_DAY','24')))
+
+def candidate_urls(raw):
+    raw=html.unescape(urllib.parse.unquote(raw)).replace('\\/','/')
+    return list(dict.fromkeys(f'https://x.com/{a}/status/{b}' for a,b in re.findall(r'(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)',raw)))[:6]
 
 def collect():
     deadline=time.monotonic()+95
@@ -19,11 +23,13 @@ def collect():
         data=None if payload is None else json.dumps(payload).encode()
         req=urllib.request.Request('https://api.brightdata.com/'+path,data=data,headers={'Authorization':'Bearer '+os.environ['BRIGHTDATA_API_KEY'],'Content-Type':'application/json'})
         with urllib.request.urlopen(req,timeout=min(35,remaining)) as response:return response.read().decode('utf-8','replace')
-    query=os.getenv('X_SEARCH_QUERY','site:x.com/ ("おやすみ" OR "お腹すいた" OR "楽しかった")')
-    target='https://www.google.com/search?'+urllib.parse.urlencode({'q':query,'num':10,'tbs':'qdr:d'})
-    raw=api('request',{'zone':os.getenv('BRIGHTDATA_ZONE','mcp_unlocker'),'url':target,'format':'raw'})
-    raw=html.unescape(urllib.parse.unquote(raw)).replace('\\/','/')
-    urls=list(dict.fromkeys(f'https://x.com/{a}/status/{b}' for a,b in re.findall(r'(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)',raw)))[:6]
+    query=os.getenv('X_SEARCH_QUERY','site:x.com/ "おやすみ"')
+    target='https://www.google.com/search?'+urllib.parse.urlencode({'q':query,'num':10,'tbs':'qdr:w'})
+    urls=[]
+    for attempt in range(2):
+        raw=api('request',{'zone':os.getenv('BRIGHTDATA_ZONE','mcp_unlocker'),'url':target,'format':'raw'})
+        urls=candidate_urls(raw)
+        if urls:break
     if not urls:raise ValueError('No candidate URLs')
     data=json.loads(api('datasets/v3/scrape?dataset_id=gd_lwxkxvnf1cynvib9co&format=json',{'input':[{'url':u} for u in urls]}))
     if isinstance(data,dict) and data.get('snapshot_id'):
@@ -53,7 +59,8 @@ def get_feed():
         today=dt.datetime.now(dt.timezone.utc).date().isoformat()
         if DAY!=today:DAY=today;COUNT=0
         now=time.monotonic()
-        if now-LAST<INTERVAL or COUNT>=LIMIT:return CACHE
+        if COUNT>=LIMIT:return dict(CACHE,refresh_notice='本日の収集上限です。保存済み候補を表示します')
+        if now-LAST<INTERVAL:return dict(CACHE,refresh_notice='サーバーの次の収集まで'+str(int(INTERVAL-(now-LAST))+1)+'秒・保存済み候補を表示')
         LAST=now;COUNT+=1
         CACHE=collect() # Failures keep the last valid feed. Count attempts toward the cap.
         return CACHE
@@ -73,3 +80,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass # Never print keys or upstream responses.
 
 if __name__=='__main__':ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
+
+
+
+
+
+
+
