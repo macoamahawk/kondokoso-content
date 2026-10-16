@@ -67,11 +67,16 @@ def get_feed():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path=='/health':self.respond(200,{'ok':True});return
+        if self.path=='/health':self.respond(200,{'ok':True,'version':'20261017-2','refresh_interval_seconds':INTERVAL});return
         if self.path!='/xposts.json':self.respond(404,{'error':'not_found'});return
         if not os.getenv('BRIGHTDATA_API_KEY'):self.respond(503,{'error':'server_not_configured'});return
         try:self.respond(200,get_feed())
-        except Exception:self.respond(503,{'error':'collection_failed','retry_after':INTERVAL})
+        except Exception as exc:
+            reason='upstream_unavailable'
+            if isinstance(exc,urllib.error.HTTPError):reason='upstream_http_'+str(exc.code)
+            elif isinstance(exc,TimeoutError):reason='collection_timeout'
+            elif isinstance(exc,ValueError) and str(exc) in ('No candidate URLs','Too few usable posts','Collection failed'):reason={'No candidate URLs':'no_candidates','Too few usable posts':'insufficient_posts','Collection failed':'scrape_failed'}[str(exc)]
+            self.respond(503,{'error':'collection_failed','reason':reason,'retry_after':INTERVAL})
     def respond(self,status,data):
         body=json.dumps(data,ensure_ascii=False).encode()
         self.send_response(status);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers()
@@ -80,6 +85,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass # Never print keys or upstream responses.
 
 if __name__=='__main__':ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
+
 
 
 
