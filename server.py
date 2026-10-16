@@ -67,12 +67,13 @@ def get_feed():
         if COUNT>=LIMIT:return dict(CACHE,refresh_notice='本日の収集上限です。保存済み候補を表示します')
         if now-LAST<INTERVAL:return dict(CACHE,refresh_notice='サーバーの次の収集まで'+str(int(INTERVAL-(now-LAST))+1)+'秒・保存済み候補を表示')
         LAST=now;COUNT+=1
-        CACHE=collect() # Failures keep the last valid feed. Count attempts toward the cap.
+        try:CACHE=collect() # Failures keep the last valid feed. Count attempts toward the cap.
+        finally:LAST=time.monotonic() # Coalesce callers that waited for the same collection.
         return CACHE
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path=='/health':self.respond(200,{'ok':True,'version':'20261017-3','refresh_interval_seconds':INTERVAL});return
+        if self.path=='/health':self.respond(200,{'ok':True,'version':'20261017-4','refresh_interval_seconds':INTERVAL});return
         if self.path!='/xposts.json':self.respond(404,{'error':'not_found'});return
         if not os.getenv('BRIGHTDATA_API_KEY'):self.respond(503,{'error':'server_not_configured'});return
         try:self.respond(200,get_feed())
@@ -90,6 +91,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass # Never print keys or upstream responses.
 
 if __name__=='__main__':ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
+
 
 
 
