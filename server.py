@@ -30,6 +30,9 @@ def collect():
         raw=api('request',{'zone':os.getenv('BRIGHTDATA_ZONE','mcp_unlocker'),'url':target,'format':'raw'})
         urls=candidate_urls(raw)
         if urls:break
+    reused_candidates=not urls
+    if reused_candidates:
+        urls=[p['source'] for p in CACHE.get('posts',[]) if re.fullmatch(r'https://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/\d+/?',p.get('source',''))][:6]
     if not urls:raise ValueError('No candidate URLs')
     data=json.loads(api('datasets/v3/scrape?dataset_id=gd_lwxkxvnf1cynvib9co&format=json',{'input':[{'url':u} for u in urls]}))
     if isinstance(data,dict) and data.get('snapshot_id'):
@@ -51,7 +54,9 @@ def collect():
         if not p.get('date_posted'):continue
         posts.append({'title':'@'+str(p.get('user_posted','')),'body':text,'source':url,'posted_at':p['date_posted'],'full_text':True});seen.add(url)
     if len(posts)<2:raise ValueError('Too few usable posts')
-    return {'schema':'xplay-v1','updated':dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec='seconds'),'posts':posts}
+    result={'schema':'xplay-v1','updated':dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec='seconds'),'posts':posts}
+    if reused_candidates:result['refresh_notice']='取得完了：新しい候補なし・既存候補の本文を再取得しました'
+    return result
 
 def get_feed():
     global CACHE,LAST,DAY,COUNT
@@ -67,7 +72,7 @@ def get_feed():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path=='/health':self.respond(200,{'ok':True,'version':'20261017-2','refresh_interval_seconds':INTERVAL});return
+        if self.path=='/health':self.respond(200,{'ok':True,'version':'20261017-3','refresh_interval_seconds':INTERVAL});return
         if self.path!='/xposts.json':self.respond(404,{'error':'not_found'});return
         if not os.getenv('BRIGHTDATA_API_KEY'):self.respond(503,{'error':'server_not_configured'});return
         try:self.respond(200,get_feed())
@@ -85,6 +90,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass # Never print keys or upstream responses.
 
 if __name__=='__main__':ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),Handler).serve_forever()
+
 
 
 
