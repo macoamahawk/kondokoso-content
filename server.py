@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '20261017-post-filters-2'
+VERSION = '20261017-post-filters-3'
 LOCK = threading.Lock()
 CACHE = {'schema': 'xplay-v1', 'updated': '', 'posts': []}
 LAST = 0.0
@@ -73,9 +73,9 @@ def candidate_urls(raw):
 
 def search_targets(now):
     # These are discovery hints. Actual post timestamps, media and metrics are checked after scraping.
-    query = 'site:x.com/ inurl:status -告知 -宣伝 -キャンペーン -クーポン -販売開始'
+    query = 'site:x.com/'
     return ['https://www.google.com/search?' + urllib.parse.urlencode({
-        'q': query, 'hl': 'ja', 'lr': 'lang_ja', 'gl': 'jp', 'tbs': f'qdr:{period},sbd:1',
+        'q': query, 'num': 20, 'hl': 'ja', 'lr': 'lang_ja', 'gl': 'jp', 'tbs': f'qdr:{period},sbd:1',
     }) for period in ('n1', 'n15', 'h', 'd')]
 
 
@@ -241,6 +241,10 @@ def collect():
             found = discover_urls(raw)
             # Check the actual creation time embedded in each ID, not the search engine's date label.
             return [url for url in found if -30 <= now.timestamp() - ((int(url.rsplit('/', 1)[1]) >> 22) + 1288834974657) / 1000 <= window]
+        except urllib.error.HTTPError as error:
+            if error.code in (402, 429):
+                raise
+            return []
         except (OSError, ValueError):
             return []
     # Search all fallback windows concurrently, then scrape only the ten newest distinct candidates.
