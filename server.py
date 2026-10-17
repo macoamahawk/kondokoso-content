@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '20261017-buffer-1'
+VERSION = '20261017-post-filters-1'
 LOCK = threading.Lock()
 CACHE = {'schema': 'xplay-v1', 'updated': '', 'posts': []}
 LAST = 0.0
@@ -25,6 +26,20 @@ LAST_STATE = 'ready'
 INTERVAL = max(30, int(os.getenv('MIN_REFRESH_SECONDS', '30')))
 LIMIT = max(0, int(os.getenv('MAX_COLLECTIONS_PER_DAY', '24')))
 MAX_AGE_SECONDS = 86400
+PREFERRED_AGE_SECONDS = 60
+MAX_METRICS = {'likes': 10, 'reposts': 2, 'replies': 5, 'views': 1000}
+FILTER_POLICY = 'quiet-text-ja-v1'
+PROMOTION = re.compile(
+    r'告知|宣伝|お知らせ|販売(?:開始|中|予定)|発売|新商品|新発売|入荷|再販|通販|'
+    r'予約(?:受付|開始|はこちら)|受付(?:開始|中)|募集中|募集開始|求人|採用情報|'
+    r'キャンペーン|プレゼント企画|抽選(?:で|販売|プレゼント)|クーポン|割引|セール|'
+    r'購入はこちら|ご購入|お買い求め|お申し込み|お申込み|申し込みはこちら|'
+    r'無料(?:相談|体験|配布)|案件(?:募集|受付)|依頼(?:募集|受付)|'
+    r'配信(?:開始|中|予定|します|のお知らせ)|ライブ配信|生配信|'
+    r'動画(?:公開|投稿しました|アップしました)|新作(?:公開|販売)|'
+    r'記事(?:公開|更新)|ブログ(?:公開|更新)|イベント(?:開催|告知)|'
+    r'(?:^|[\s#＃【])pr(?:$|[\s】:#＃])|プロモーション|広告|'
+    r'\b(?:sponsored|giveaway|coupon|sale|discount|affiliate)\b', re.I)
 POST_URL = re.compile(r'https://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)(?:/[^?]*)?(?:\?.*)?$')
 
 
@@ -57,11 +72,11 @@ def candidate_urls(raw):
 
 
 def search_targets(now):
-    # No topic, account, popularity or engagement criteria. Japanese is checked on the returned text.
-    query = 'site:x.com/'
+    # These are discovery hints. Actual post timestamps, media and metrics are checked after scraping.
+    query = 'site:x.com/ inurl:status -告知 -宣伝 -キャンペーン -クーポン -販売開始'
     return ['https://www.google.com/search?' + urllib.parse.urlencode({
-        'q': query, 'num': 20, 'hl': 'ja', 'lr': 'lang_ja', 'gl': 'jp', 'tbs': f'qdr:{period},sbd:1',
-    }) for period in ('h', 'd')]
+        'q': query, 'hl': 'ja', 'lr': 'lang_ja', 'gl': 'jp', 'tbs': f'qdr:{period},sbd:1',
+    }) for period in ('n1', 'n15', 'h', 'd')]
 
 
 def search_body(raw):
@@ -123,6 +138,52 @@ def discover_urls(raw):
     return candidate_urls('\n'.join(urls))
 
 
+def has_content(value):
+    if isinstance(value, dict):
+        return any(has_content(v) for v in value.values())
+    if isinstance(value, list):
+        return any(has_content(v) for v in value)
+    if isinstance(value, str):
+        return value.strip().lower() not in ('', 'null', 'none', 'false', '[]', '{}')
+    return bool(value)
+
+
+def metric_count(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if math.isfinite(value) and value >= 0 and value == int(value) else None
+    if isinstance(value, str):
+        clean = unicodedata.normalize('NFKC', value).strip().replace(',', '')
+        match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([kKmM万億]?)', clean)
+        if match:
+            count = float(match[1]) * {'': 1, 'k': 1000, 'm': 1000000, '万': 10000, '億': 100000000}[match[2].lower()]
+            return math.ceil(count) if math.isfinite(count) else None
+    return None
+
+
+def eligible_metadata(row, text):
+    # Missing metadata is unknown, never evidence of zero views or no image/quote.
+    if 'photos' not in row or 'quoted_post' not in row:
+        return None
+    if any(has_content(row.get(key)) for key in ('photos', 'external_image_urls', 'ai_generated_images')):
+        return None
+    if has_content(row['quoted_post']) or any(has_content(row.get(key)) for key in ('is_quote', 'is_quote_status', 'quoted_status_id')):
+        return None
+    if any(ref.get('type') == 'quoted' for ref in (row.get('referenced_tweets') or []) if isinstance(ref, dict)):
+        return None
+    metrics = {key: metric_count(row.get(key)) for key in MAX_METRICS}
+    if any(value is None or value > MAX_METRICS[key] for key, value in metrics.items()):
+        return None
+    normalized = unicodedata.normalize('NFKC', text)
+    if PROMOTION.search(normalized) or any(has_content(row.get(key)) for key in ('is_promoted', 'is_ad', 'promoted_content')):
+        return None
+    # Links are conservatively excluded as well to reduce unlabelled ads and announcements.
+    if re.search(r'https?://|www\.', normalized, re.I) or has_content(row.get('external_url')):
+        return None
+    return metrics
+
+
 def normalize_posts(rows, now=None):
     now = now or utcnow()
     posts = {}
@@ -140,7 +201,10 @@ def normalize_posts(rows, now=None):
             continue
         if not lang and not re.search('[ぁ-んァ-ン]', text):
             continue
-        if not match or not stamp or not -300 <= (now - stamp).total_seconds() <= MAX_AGE_SECONDS:
+        if not match or not stamp or not -30 <= (now - stamp).total_seconds() <= MAX_AGE_SECONDS:
+            continue
+        metrics = eligible_metadata(row, text)
+        if metrics is None:
             continue
         ident = match[2]
         posts[ident] = {
@@ -149,6 +213,8 @@ def normalize_posts(rows, now=None):
             'posted_at': stamp.isoformat(timespec='seconds'),
             'fetched_at': row.get('fetched_at') or now.isoformat(timespec='seconds'),
             'full_text': True,
+            'photos': [], 'quoted_post': None, **metrics,
+            'filter_policy': FILTER_POLICY,
         }
     return sorted(posts.values(), key=lambda post: parse_time(post['posted_at']), reverse=True)
 
@@ -169,12 +235,15 @@ def collect():
 
     urls = []
     now = utcnow()
-    for target in search_targets(now):
+    for target, window in zip(search_targets(now), (60, 900, 3600, MAX_AGE_SECONDS)):
+        if urls and deadline - time.monotonic() < 40:
+            break
         raw = api('request', {'zone': os.getenv('BRIGHTDATA_ZONE', 'mcp_unlocker'), 'url': target, 'format': 'raw'})
-        urls = discover_urls(raw)
+        found = discover_urls(raw)
         # A post ID embeds its creation time. Discard old search-index hits before paying to scrape them.
-        urls = [url for url in urls if -300 <= now.timestamp() - ((int(url.rsplit('/', 1)[1]) >> 22) + 1288834974657) / 1000 <= MAX_AGE_SECONDS]
-        if len(urls) >= 3:
+        found = [url for url in found if -30 <= now.timestamp() - ((int(url.rsplit('/', 1)[1]) >> 22) + 1288834974657) / 1000 <= window]
+        urls = candidate_urls('\n'.join(urls + found))
+        if len(urls) >= 10:
             break
     if not urls:
         raise ValueError('no_fresh_candidates')
@@ -194,16 +263,23 @@ def collect():
     if not isinstance(data, list):
         raise TimeoutError('collection_timeout')
     posts = normalize_posts(data)
-    if not posts:
-        raise ValueError('no_fresh_japanese_posts')
-    return {'schema': 'xplay-v1', 'updated': utcnow().isoformat(timespec='seconds'), 'posts': posts}
+    accepted = {post['source'] for post in posts}
+    rejected = []
+    for row in data:
+        if isinstance(row, dict):
+            source = candidate_urls(str(row.get('url') or row.get('source') or ''))
+            rejected += [url for url in source if url not in accepted]
+    return {'schema': 'xplay-v1', 'updated': utcnow().isoformat(timespec='seconds'),
+            'posts': posts, 'rejected_sources': rejected}
 
 
 def merge_feed(previous, incoming):
     # Retain original acquisition time for duplicate posts; a failed/new-empty search cannot fake freshness.
     by_source = {p['source']: p for p in incoming.get('posts', [])}
-    for post in previous.get('posts', []):
-        by_source[post['source']] = post
+    rejected = set(incoming.get('rejected_sources', []))
+    for post in normalize_posts(previous.get('posts', [])):
+        if post['source'] not in rejected:
+            by_source[post['source']] = post
     posts = normalize_posts(list(by_source.values()))[:12]
     result = {'schema': 'xplay-v1', 'updated': incoming.get('updated', previous.get('updated', '')), 'posts': posts}
     while posts and len(json.dumps(result, ensure_ascii=False).encode('utf-16-le')) // 2 > 44000:
@@ -255,16 +331,20 @@ def get_feed():
             state, retry = 'collecting', 5
             threading.Thread(target=collection_worker, daemon=True).start()
         notices = {
-            'collecting': '次の日本語投稿を先読みしています',
-            'ready': '新しい日本語投稿を準備しました',
+            'collecting': '画像・引用・告知を除き、反応の少ない日本語投稿を先読み中です',
+            'ready': '条件に合う日本語投稿を新しい順に準備しました',
             'cooldown': '取得間隔を空けて、必要な分を自動で補充します',
             'daily_limit': '本日の収集上限です。準備済みの投稿を表示します',
-            'no_new_posts': '新しい日本語投稿がまだ見つかりません。自動で再試行します',
+            'no_new_posts': '条件に合う新しい投稿がまだありません。条件を保って自動で再試行します',
             'upstream_limit': '取得サービスの利用枠を確認してください。準備済みの投稿を維持します',
             'error': '取得に失敗しました。準備済みの投稿を保って自動で再試行します',
         }
         return dict(CACHE, collection_state=state, retry_after=retry,
-                    refresh_notice=notices[state], ordering='posted_at_desc', language='ja')
+                    refresh_notice=notices[state], ordering='posted_at_desc', language='ja',
+                    filter_policy=FILTER_POLICY, preferred_age_seconds=PREFERRED_AGE_SECONDS,
+                    filters={'no_images': True, 'no_quotes': True, 'no_promotion': True,
+                             'no_links': True, 'max_metrics': MAX_METRICS,
+                             'unknown_metadata': 'exclude', 'freshness': 'prefer_60s_then_newest_available'})
 
 
 class Handler(BaseHTTPRequestHandler):
