@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '20261017-post-filters-1'
+VERSION = '20261017-post-filters-2'
 LOCK = threading.Lock()
 CACHE = {'schema': 'xplay-v1', 'updated': '', 'posts': []}
 LAST = 0.0
@@ -220,7 +220,7 @@ def normalize_posts(rows, now=None):
 
 
 def collect():
-    deadline = time.monotonic() + 140
+    deadline = time.monotonic() + 180
 
     def api(path, payload=None):
         remaining = deadline - time.monotonic()
@@ -233,18 +233,21 @@ def collect():
         with urllib.request.urlopen(request, timeout=min(45, remaining)) as response:
             return response.read().decode('utf-8', 'replace')
 
-    urls = []
     now = utcnow()
-    for target, window in zip(search_targets(now), (60, 900, 3600, MAX_AGE_SECONDS)):
-        if urls and deadline - time.monotonic() < 40:
-            break
-        raw = api('request', {'zone': os.getenv('BRIGHTDATA_ZONE', 'mcp_unlocker'), 'url': target, 'format': 'raw'})
-        found = discover_urls(raw)
-        # A post ID embeds its creation time. Discard old search-index hits before paying to scrape them.
-        found = [url for url in found if -30 <= now.timestamp() - ((int(url.rsplit('/', 1)[1]) >> 22) + 1288834974657) / 1000 <= window]
-        urls = candidate_urls('\n'.join(urls + found))
-        if len(urls) >= 10:
-            break
+    def discover_window(pair):
+        target, window = pair
+        try:
+            raw = api('request', {'zone': os.getenv('BRIGHTDATA_ZONE', 'mcp_unlocker'), 'url': target, 'format': 'raw'})
+            found = discover_urls(raw)
+            # Check the actual creation time embedded in each ID, not the search engine's date label.
+            return [url for url in found if -30 <= now.timestamp() - ((int(url.rsplit('/', 1)[1]) >> 22) + 1288834974657) / 1000 <= window]
+        except (OSError, ValueError):
+            return []
+    # Search all fallback windows concurrently, then scrape only the ten newest distinct candidates.
+    # This bounds the collection cost and gives sub-minute candidates priority without serial waits.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        batches = list(pool.map(discover_window, zip(search_targets(now), (60, 900, 3600, MAX_AGE_SECONDS))))
+    urls = candidate_urls('\n'.join(url for batch in batches for url in batch))
     if not urls:
         raise ValueError('no_fresh_candidates')
     data = json.loads(api('datasets/v3/scrape?dataset_id=gd_lwxkxvnf1cynvib9co&format=json', {'input': [{'url': url} for url in urls[:10]]}))
