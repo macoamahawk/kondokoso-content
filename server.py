@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '20261017-post-filters-3'
+VERSION = '20261019-no-replies-or-tags-1'
 LOCK = threading.Lock()
 CACHE = {'schema': 'xplay-v1', 'updated': '', 'posts': []}
 LAST = 0.0
@@ -28,7 +28,7 @@ LIMIT = max(0, int(os.getenv('MAX_COLLECTIONS_PER_DAY', '24')))
 MAX_AGE_SECONDS = 86400
 PREFERRED_AGE_SECONDS = 60
 MAX_METRICS = {'likes': 10, 'reposts': 2, 'replies': 5, 'views': 1000}
-FILTER_POLICY = 'quiet-text-ja-v1'
+FILTER_POLICY = 'quiet-text-ja-no-replies-tags-v2'
 PROMOTION = re.compile(
     r'告知|宣伝|お知らせ|販売(?:開始|中|予定)|発売|新商品|新発売|入荷|再販|通販|'
     r'予約(?:受付|開始|はこちら)|受付(?:開始|中)|募集中|募集開始|求人|採用情報|'
@@ -163,6 +163,23 @@ def metric_count(value):
 
 
 def eligible_metadata(row, text):
+    # A reply can have no visible @ prefix. Check structured relationships as well as text.
+    reply_fields = ('is_reply', 'in_reply_to_status_id', 'in_reply_to_status_id_str',
+                    'in_reply_to_user_id', 'in_reply_to_user_id_str', 'reply_to',
+                    'replying_to', 'parent_post_url', 'parent_url')
+    if any(has_content(row.get(key)) for key in reply_fields):
+        return None
+    if str(row.get('post_type', '')).lower() in ('reply', 'replied_to'):
+        return None
+    parent = row.get('parent_post_details') or {}
+    own_id = str(row.get('id') or str(row.get('url') or row.get('source') or '').split('/status/')[-1].split('?')[0])
+    if isinstance(parent, dict) and has_content(parent.get('post_id')) and str(parent['post_id']) != own_id:
+        return None
+    if any(ref.get('type') == 'replied_to' for ref in (row.get('referenced_tweets') or []) if isinstance(ref, dict)):
+        return None
+    normalized = unicodedata.normalize('NFKC', text)
+    if re.search(r'[#@]', normalized) or any(has_content(row.get(key)) for key in ('hashtags', 'tagged_users', 'mentions')):
+        return None
     # Missing metadata is unknown, never evidence of zero views or no image/quote.
     if 'photos' not in row or 'quoted_post' not in row:
         return None
@@ -175,7 +192,6 @@ def eligible_metadata(row, text):
     metrics = {key: metric_count(row.get(key)) for key in MAX_METRICS}
     if any(value is None or value > MAX_METRICS[key] for key, value in metrics.items()):
         return None
-    normalized = unicodedata.normalize('NFKC', text)
     if PROMOTION.search(normalized) or any(has_content(row.get(key)) for key in ('is_promoted', 'is_ad', 'promoted_content')):
         return None
     # Links are conservatively excluded as well to reduce unlabelled ads and announcements.
@@ -214,6 +230,7 @@ def normalize_posts(rows, now=None):
             'fetched_at': row.get('fetched_at') or now.isoformat(timespec='seconds'),
             'full_text': True,
             'photos': [], 'quoted_post': None, **metrics,
+            'is_reply': False, 'hashtags': [], 'tagged_users': [],
             'filter_policy': FILTER_POLICY,
         }
     return sorted(posts.values(), key=lambda post: parse_time(post['posted_at']), reverse=True)
@@ -338,7 +355,7 @@ def get_feed():
             state, retry = 'collecting', 5
             threading.Thread(target=collection_worker, daemon=True).start()
         notices = {
-            'collecting': '画像・引用・告知を除き、反応の少ない日本語投稿を先読み中です',
+            'collecting': '画像・引用・返信・タグ・告知を除き、反応の少ない日本語投稿を先読み中です',
             'ready': '条件に合う日本語投稿を新しい順に準備しました',
             'cooldown': '取得間隔を空けて、必要な分を自動で補充します',
             'daily_limit': '本日の収集上限です。準備済みの投稿を表示します',
@@ -350,6 +367,7 @@ def get_feed():
                     refresh_notice=notices[state], ordering='posted_at_desc', language='ja',
                     filter_policy=FILTER_POLICY, preferred_age_seconds=PREFERRED_AGE_SECONDS,
                     filters={'no_images': True, 'no_quotes': True, 'no_promotion': True,
+                             'no_replies': True, 'no_hashtags': True, 'no_mentions': True,
                              'no_links': True, 'max_metrics': MAX_METRICS,
                              'unknown_metadata': 'exclude', 'freshness': 'prefer_60s_then_newest_available'})
 
