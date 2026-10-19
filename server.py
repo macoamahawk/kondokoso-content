@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = '20261019-no-replies-or-tags-1'
+VERSION = '20261019-popularity-ignored-1'
 LOCK = threading.Lock()
 CACHE = {'schema': 'xplay-v1', 'updated': '', 'posts': []}
 LAST = 0.0
@@ -27,8 +27,7 @@ INTERVAL = max(30, int(os.getenv('MIN_REFRESH_SECONDS', '30')))
 LIMIT = max(0, int(os.getenv('MAX_COLLECTIONS_PER_DAY', '24')))
 MAX_AGE_SECONDS = 86400
 PREFERRED_AGE_SECONDS = 60
-MAX_METRICS = {'likes': 10, 'reposts': 2, 'replies': 5, 'views': 1000}
-FILTER_POLICY = 'quiet-text-ja-no-replies-tags-v2'
+FILTER_POLICY = 'text-ja-no-replies-tags-v3'
 PROMOTION = re.compile(
     r'告知|宣伝|お知らせ|販売(?:開始|中|予定)|発売|新商品|新発売|入荷|再販|通販|'
     r'予約(?:受付|開始|はこちら)|受付(?:開始|中)|募集中|募集開始|求人|採用情報|'
@@ -72,7 +71,7 @@ def candidate_urls(raw):
 
 
 def search_targets(now):
-    # These are discovery hints. Actual post timestamps, media and metrics are checked after scraping.
+    # Discovery hints only. Actual timestamps and content metadata are checked after scraping.
     query = 'site:x.com/'
     return ['https://www.google.com/search?' + urllib.parse.urlencode({
         'q': query, 'num': 20, 'hl': 'ja', 'lr': 'lang_ja', 'gl': 'jp', 'tbs': f'qdr:{period},sbd:1',
@@ -148,20 +147,6 @@ def has_content(value):
     return bool(value)
 
 
-def metric_count(value):
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return int(value) if math.isfinite(value) and value >= 0 and value == int(value) else None
-    if isinstance(value, str):
-        clean = unicodedata.normalize('NFKC', value).strip().replace(',', '')
-        match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([kKmM万億]?)', clean)
-        if match:
-            count = float(match[1]) * {'': 1, 'k': 1000, 'm': 1000000, '万': 10000, '億': 100000000}[match[2].lower()]
-            return math.ceil(count) if math.isfinite(count) else None
-    return None
-
-
 def eligible_metadata(row, text):
     # A reply can have no visible @ prefix. Check structured relationships as well as text.
     reply_fields = ('is_reply', 'in_reply_to_status_id', 'in_reply_to_status_id_str',
@@ -180,7 +165,7 @@ def eligible_metadata(row, text):
     normalized = unicodedata.normalize('NFKC', text)
     if re.search(r'[#@]', normalized) or any(has_content(row.get(key)) for key in ('hashtags', 'tagged_users', 'mentions')):
         return None
-    # Missing metadata is unknown, never evidence of zero views or no image/quote.
+    # Image/quote metadata is required. Engagement data is deliberately ignored.
     if 'photos' not in row or 'quoted_post' not in row:
         return None
     if any(has_content(row.get(key)) for key in ('photos', 'external_image_urls', 'ai_generated_images')):
@@ -189,15 +174,12 @@ def eligible_metadata(row, text):
         return None
     if any(ref.get('type') == 'quoted' for ref in (row.get('referenced_tweets') or []) if isinstance(ref, dict)):
         return None
-    metrics = {key: metric_count(row.get(key)) for key in MAX_METRICS}
-    if any(value is None or value > MAX_METRICS[key] for key, value in metrics.items()):
-        return None
     if PROMOTION.search(normalized) or any(has_content(row.get(key)) for key in ('is_promoted', 'is_ad', 'promoted_content')):
         return None
     # Links are conservatively excluded as well to reduce unlabelled ads and announcements.
     if re.search(r'https?://|www\.', normalized, re.I) or has_content(row.get('external_url')):
         return None
-    return metrics
+    return True
 
 
 def normalize_posts(rows, now=None):
@@ -219,8 +201,7 @@ def normalize_posts(rows, now=None):
             continue
         if not match or not stamp or not -30 <= (now - stamp).total_seconds() <= MAX_AGE_SECONDS:
             continue
-        metrics = eligible_metadata(row, text)
-        if metrics is None:
+        if eligible_metadata(row, text) is None:
             continue
         ident = match[2]
         posts[ident] = {
@@ -229,7 +210,7 @@ def normalize_posts(rows, now=None):
             'posted_at': stamp.isoformat(timespec='seconds'),
             'fetched_at': row.get('fetched_at') or now.isoformat(timespec='seconds'),
             'full_text': True,
-            'photos': [], 'quoted_post': None, **metrics,
+            'photos': [], 'quoted_post': None,
             'is_reply': False, 'hashtags': [], 'tagged_users': [],
             'filter_policy': FILTER_POLICY,
         }
@@ -355,7 +336,7 @@ def get_feed():
             state, retry = 'collecting', 5
             threading.Thread(target=collection_worker, daemon=True).start()
         notices = {
-            'collecting': '画像・引用・返信・タグ・告知を除き、反応の少ない日本語投稿を先読み中です',
+            'collecting': '画像・引用・返信・タグ・告知を除き、新しい日本語投稿を先読み中です',
             'ready': '条件に合う日本語投稿を新しい順に準備しました',
             'cooldown': '取得間隔を空けて、必要な分を自動で補充します',
             'daily_limit': '本日の収集上限です。準備済みの投稿を表示します',
@@ -368,8 +349,8 @@ def get_feed():
                     filter_policy=FILTER_POLICY, preferred_age_seconds=PREFERRED_AGE_SECONDS,
                     filters={'no_images': True, 'no_quotes': True, 'no_promotion': True,
                              'no_replies': True, 'no_hashtags': True, 'no_mentions': True,
-                             'no_links': True, 'max_metrics': MAX_METRICS,
-                             'unknown_metadata': 'exclude', 'freshness': 'prefer_60s_then_newest_available'})
+                             'no_links': True, 'popularity_filter': False,
+                             'unknown_image_or_quote_metadata': 'exclude', 'freshness': 'prefer_60s_then_newest_available'})
 
 
 class Handler(BaseHTTPRequestHandler):
